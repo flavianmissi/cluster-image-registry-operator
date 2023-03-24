@@ -12,14 +12,17 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2019-06-01/storage"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest"
 	autorestazure "github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/jongio/azidext/go/azidext"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -46,6 +49,10 @@ const (
 	storageExistsReasonContainerExists   = "ContainerExists"
 	storageExistsReasonContainerDeleted  = "ContainerDeleted"
 	storageExistsReasonAccountDeleted    = "AccountDeleted"
+
+	defaultPollingDelay    = 10 * time.Second
+	defaultPollingDuration = 3 * time.Minute
+	defaultRetryAttempts   = 1
 )
 
 // storageAccountInvalidCharRe is a regular expression for characters that
@@ -152,6 +159,252 @@ func (d *driver) accountExists(storageAccountsClient storage.AccountsClient, acc
 			Type: to.StringPtr("Microsoft.Storage/storageAccounts"),
 		},
 	)
+}
+
+func (d *driver) createPrivateEndpoint(
+	privateEndpointsClient *armnetwork.PrivateEndpointsClient,
+	resourceGroupName,
+	privateEndpointName,
+	accountName,
+	location,
+	subscriptionID,
+	cloudName string,
+	tagset map[string]*string,
+) (*armnetwork.PrivateEndpoint, error) {
+	klog.Infof(
+		"attempt to create azure private endpoint %s (resourceGroup=%q, location=%q)...",
+		privateEndpointName, resourceGroupName, location,
+	)
+
+	vnetName := "fmissi-ms799-vnet"            // TODO: figure out where to get this from
+	subnetName := "fmissi-ms799-worker-subnet" // TODO: figure out where to get this from
+
+	// TODO: is there a better way to build this?
+	subnetID := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks/%s/subnets/%s",
+		subscriptionID,
+		resourceGroupName,
+		vnetName,
+		subnetName,
+	)
+	// TODO: is there a better way to build this?
+	privateLinkResource := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Storage/storageAccounts/%s",
+		subscriptionID,
+		resourceGroupName,
+		accountName,
+	)
+	targetSubResource := "blob" // TODO: is there a constant we can use here instead?
+
+	params := armnetwork.PrivateEndpoint{
+		Location: to.StringPtr(location),
+		Tags:     tagset,
+		Properties: &armnetwork.PrivateEndpointProperties{
+			CustomNetworkInterfaceName: to.StringPtr(fmt.Sprintf("%s-nic", privateEndpointName)),
+			Subnet:                     &armnetwork.Subnet{ID: to.StringPtr(subnetID)},
+			PrivateLinkServiceConnections: []*armnetwork.PrivateLinkServiceConnection{{
+				Name: to.StringPtr(privateEndpointName),
+				Properties: &armnetwork.PrivateLinkServiceConnectionProperties{
+					PrivateLinkServiceID: to.StringPtr(privateLinkResource),
+					GroupIDs:             []*string{to.StringPtr(targetSubResource)},
+				},
+			}},
+		},
+	}
+
+	pollersResp, err := privateEndpointsClient.BeginCreateOrUpdate(
+		d.Context,
+		resourceGroupName,
+		privateEndpointName,
+		params,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start creating private endpoint: %s", err)
+	}
+	resp, err := pollersResp.PollUntilDone(d.Context, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to finish creating private endpoint: %s", err)
+	}
+
+	// ??? set Subnet.PrivateEndpointNetworkPolicies: to.StringPtr("Enabled") ???
+
+	klog.Infof("azure private endpoint %s has been created", privateEndpointName)
+	return &resp.PrivateEndpoint, nil
+}
+
+func (d *driver) createRecordSet(
+	client *armprivatedns.RecordSetsClient,
+	nicClient *armnetwork.InterfacesClient,
+	privateEndpoint *armnetwork.PrivateEndpoint,
+	resourceGroupName,
+	accountName,
+	privateZoneName string,
+) error {
+	relativeRecordSetName := accountName
+	klog.Infof(
+		"attempt to create azure record set %s (resourceGroup=%q)...",
+		relativeRecordSetName,
+		resourceGroupName,
+	)
+
+	if len(privateEndpoint.Properties.NetworkInterfaces) == 0 {
+		return fmt.Errorf("private endpoint %s did not have any network interfaces", *privateEndpoint.Name)
+	}
+	nic := privateEndpoint.Properties.NetworkInterfaces[0]
+	nicIDParts := strings.Split(*nic.ID, "/")
+	nicName := nicIDParts[len(nicIDParts)-1]
+	// klog.Infof(
+	// 	"split nic name: %s -- nic name from private endpoint: %s",
+	// 	nicName, *nic.Name,
+	// )
+	resp, err := nicClient.Get(d.Context, resourceGroupName, nicName, nil)
+	if err != nil {
+		return err
+	}
+	respNIC := resp.Interface
+	if len(respNIC.Properties.IPConfigurations) == 0 {
+		return fmt.Errorf("network interface %s did not have any IP configurations", *respNIC.Name)
+	}
+	// this is auto-created by Azure and there should always ever be one.
+	nicAddress := respNIC.Properties.IPConfigurations[0].Properties.PrivateIPAddress
+
+	rs := armprivatedns.RecordSet{
+		Properties: &armprivatedns.RecordSetProperties{
+			TTL: to.Int64Ptr(10),
+			ARecords: []*armprivatedns.ARecord{{
+				IPv4Address: nicAddress,
+			}},
+		},
+	}
+	_, err = client.CreateOrUpdate(
+		d.Context,
+		resourceGroupName,
+		privateZoneName,
+		armprivatedns.RecordTypeA,
+		relativeRecordSetName,
+		rs,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create record set: %s", err)
+	}
+	klog.Infof("azure record set %s has been created", relativeRecordSetName)
+	return nil
+}
+
+func (d *driver) createPrivateDNSZoneGroup(
+	client *armnetwork.PrivateDNSZoneGroupsClient,
+	subscriptionID,
+	resourceGroupName,
+	privateEndpointName,
+	privateZoneName string,
+) error {
+	privateZoneID := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/privateDnsZones/%s",
+		subscriptionID,
+		resourceGroupName,
+		privateZoneName,
+	)
+	groupName := strings.Replace(privateZoneName, ".", "-", -1)
+	group := armnetwork.PrivateDNSZoneGroup{
+		Name: to.StringPtr(fmt.Sprintf("%s/default", privateZoneName)),
+		Properties: &armnetwork.PrivateDNSZoneGroupPropertiesFormat{
+			PrivateDNSZoneConfigs: []*armnetwork.PrivateDNSZoneConfig{{
+				Name: to.StringPtr("privatelink-blob-core-windows-net"),
+				Properties: &armnetwork.PrivateDNSZonePropertiesFormat{
+					PrivateDNSZoneID: to.StringPtr(privateZoneID),
+				},
+			}},
+		},
+	}
+	pollersResp, err := client.BeginCreateOrUpdate(
+		d.Context,
+		resourceGroupName,
+		privateEndpointName,
+		groupName,
+		group,
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to start creating private DNS zone group: %s", err)
+	}
+	_, err = pollersResp.PollUntilDone(d.Context, nil)
+	if err != nil {
+		return fmt.Errorf("failed to finish creating private DNS zone group: %s", err)
+	}
+	return nil
+}
+
+func (d *driver) createVirtualNetworkLink(
+	client *armprivatedns.VirtualNetworkLinksClient,
+	subscriptionID,
+	resourceGroupName,
+	privateZoneName,
+	vnetName string,
+	tagset map[string]*string,
+) error {
+	// * TODO: add virtual network link to private DNS zone (how?)
+	virtualNetworkLinkName := "whatever123"
+	location := "global"
+	vnetID := fmt.Sprintf(
+		"/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/virtualNetworks/%s",
+		subscriptionID,
+		resourceGroupName,
+		vnetName,
+	)
+	pollersResp, err := client.BeginCreateOrUpdate(
+		d.Context,
+		resourceGroupName,
+		privateZoneName,
+		virtualNetworkLinkName,
+		armprivatedns.VirtualNetworkLink{
+			Location: to.StringPtr(location),
+			Tags:     tagset,
+			Properties: &armprivatedns.VirtualNetworkLinkProperties{
+				RegistrationEnabled: to.BoolPtr(false),
+				VirtualNetwork:      &armprivatedns.SubResource{ID: to.StringPtr(vnetID)},
+			},
+		},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = pollersResp.PollUntilDone(d.Context, nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *driver) createPrivateDNSZone(
+	client *armprivatedns.PrivateZonesClient,
+	resourceGroupName,
+	cloudName,
+	privateZoneName string,
+	tagset map[string]*string,
+) error {
+	// TODO: call this somewhere
+	location := "global"
+	pollersResp, err := client.BeginCreateOrUpdate(
+		d.Context,
+		resourceGroupName,
+		privateZoneName,
+		armprivatedns.PrivateZone{
+			Location: to.StringPtr(location),
+			Tags:     tagset,
+		},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = pollersResp.PollUntilDone(d.Context, nil)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (d *driver) createStorageAccount(storageAccountsClient storage.AccountsClient, resourceGroupName, accountName, location, cloudName string, tagset map[string]*string) error {
@@ -295,38 +548,18 @@ func NewDriver(ctx context.Context, c *imageregistryv1.ImageRegistryConfigStorag
 
 func (d *driver) storageAccountsClient(cfg *Azure, environment autorestazure.Environment) (storage.AccountsClient, error) {
 	storageAccountsClient := storage.NewAccountsClientWithBaseURI(environment.ResourceManagerEndpoint, cfg.SubscriptionID)
-	storageAccountsClient.PollingDelay = 10 * time.Second
-	storageAccountsClient.PollingDuration = 3 * time.Minute
-	storageAccountsClient.RetryAttempts = 1
+	storageAccountsClient.PollingDelay = defaultPollingDelay
+	storageAccountsClient.PollingDuration = defaultPollingDuration
+	storageAccountsClient.RetryAttempts = defaultRetryAttempts
 	_ = storageAccountsClient.AddToUserAgent(defaults.UserAgent)
 
-	if d.authorizer != nil {
-		storageAccountsClient.Authorizer = d.authorizer
-	} else {
-		cloudConfig := cloud.Configuration{
-			ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
-			Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
-				cloud.ResourceManager: {
-					Audience: environment.TokenAudience,
-					Endpoint: environment.ResourceManagerEndpoint,
-				},
-			},
-		}
-		options := azidentity.ClientSecretCredentialOptions{
-			ClientOptions: azcore.ClientOptions{
-				Cloud: cloudConfig,
-			},
-		}
-		cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	storageAccountsClient.Authorizer = d.authorizer
+	if d.authorizer == nil {
+		authz, err := authorizer(cfg, environment)
 		if err != nil {
 			return storage.AccountsClient{}, err
 		}
-		scope := environment.TokenAudience
-		if !strings.HasSuffix(scope, "/.default") {
-			scope += "/.default"
-		}
-
-		storageAccountsClient.Authorizer = azidext.NewTokenCredentialAdapter(cred, []string{scope})
+		storageAccountsClient.Authorizer = authz
 	}
 
 	if d.sender != nil {
@@ -334,6 +567,228 @@ func (d *driver) storageAccountsClient(cfg *Azure, environment autorestazure.Env
 	}
 
 	return storageAccountsClient, nil
+}
+
+func (d *driver) privateEndpointsClient(cfg *Azure, environment autorestazure.Environment) (*armnetwork.PrivateEndpointsClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armnetwork.NewPrivateEndpointsClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (d *driver) privateZonesClient(cfg *Azure, environment autorestazure.Environment) (*armprivatedns.PrivateZonesClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armprivatedns.NewPrivateZonesClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (d *driver) recordSetsClient(cfg *Azure, environment autorestazure.Environment) (*armprivatedns.RecordSetsClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armprivatedns.NewRecordSetsClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (d *driver) privateZoneGroupsClient(cfg *Azure, environment autorestazure.Environment) (*armnetwork.PrivateDNSZoneGroupsClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armnetwork.NewPrivateDNSZoneGroupsClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (d *driver) vnetLinksClient(cfg *Azure, environment autorestazure.Environment) (*armprivatedns.VirtualNetworkLinksClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armprivatedns.NewVirtualNetworkLinksClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (d *driver) interfacesClient(cfg *Azure, environment autorestazure.Environment) (*armnetwork.InterfacesClient, error) {
+	cloudConfig := cloud.Configuration{
+		ActiveDirectoryAuthorityHost: environment.ActiveDirectoryEndpoint,
+		Services: map[cloud.ServiceName]cloud.ServiceConfiguration{
+			cloud.ResourceManager: {
+				Audience: environment.TokenAudience,
+				Endpoint: environment.ResourceManagerEndpoint,
+			},
+		},
+	}
+	options := azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud: cloudConfig,
+		},
+	}
+	cred, err := azidentity.NewClientSecretCredential(cfg.TenantID, cfg.ClientID, cfg.ClientSecret, &options)
+	if err != nil {
+		return nil, err
+	}
+	cliopts := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries: -1, // try once
+			},
+		},
+	}
+	if d.sender != nil {
+		cliopts.ClientOptions.Transport = d.sender
+	}
+	client, err := armnetwork.NewInterfacesClient(cfg.SubscriptionID, cred, cliopts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
 }
 
 func (d *driver) getKey(cfg *Azure, environment autorestazure.Environment) (string, error) {
@@ -544,6 +999,88 @@ func (d *driver) assureStorageAccount(cfg *Azure, infra *configv1.Infrastructure
 		storageAccountCreated = true
 		if err := d.createStorageAccount(
 			storageAccountsClient, cfg.ResourceGroup, accountName, cfg.Region, d.Config.CloudName, tagset,
+		); err != nil {
+			return "", false, err
+		}
+
+		privateEndpointsClient, err := d.privateEndpointsClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+		privateZonesClient, err := d.privateZonesClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+		recordSetsClient, err := d.recordSetsClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+		privateZoneGroupsClient, err := d.privateZoneGroupsClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+		vnetLinksClient, err := d.vnetLinksClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+		interfacesClient, err := d.interfacesClient(cfg, environment)
+		if err != nil {
+			return "", false, err
+		}
+
+		// TODO: save the private endpoint name in the operator config
+		privateEndpointName := generateAccountName(infra.Status.InfrastructureName)
+		privateEndpoint, err := d.createPrivateEndpoint(
+			privateEndpointsClient,
+			cfg.ResourceGroup,
+			privateEndpointName,
+			accountName,
+			cfg.Region,
+			cfg.SubscriptionID,
+			d.Config.CloudName,
+			tagset,
+		)
+		if err != nil {
+			return "", false, err
+		}
+
+		privateZoneName := "privatelink.blob.core.windows.net"
+		if err := d.createPrivateDNSZone(
+			privateZonesClient,
+			cfg.ResourceGroup,
+			d.Config.CloudName,
+			privateZoneName,
+			tagset,
+		); err != nil {
+			return "", false, err
+		}
+		if err := d.createRecordSet(
+			recordSetsClient,
+			interfacesClient,
+			privateEndpoint,
+			cfg.ResourceGroup,
+			accountName,
+			privateZoneName,
+		); err != nil {
+			return "", false, err
+		}
+		if err := d.createPrivateDNSZoneGroup(
+			privateZoneGroupsClient,
+			cfg.SubscriptionID,
+			cfg.ResourceGroup,
+			*privateEndpoint.Name,
+			privateZoneName,
+		); err != nil {
+			return "", false, err
+		}
+		vnetName := "fmissi-ms799-vnet"
+		if err := d.createVirtualNetworkLink(
+			vnetLinksClient,
+			cfg.SubscriptionID,
+			cfg.ResourceGroup,
+			privateZoneName,
+			vnetName,
+			tagset,
 		); err != nil {
 			return "", false, err
 		}

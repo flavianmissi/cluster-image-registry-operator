@@ -89,11 +89,13 @@ func (e *errDoesNotExist) Error() string {
 // present this function loads credentials from cluster wide config present on secret
 // CloudCredentialsName.
 func GetConfig(secLister kcorelisters.SecretNamespaceLister, infraLister configlisters.InfrastructureLister) (*Azure, error) {
+	klog.Info("GetConfig: starting...")
 	sec, err := secLister.Get(defaults.ImageRegistryPrivateConfigurationUser)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			return nil, fmt.Errorf("unable to get user provided secrets: %s", err)
 		}
+		klog.Info("GetConfig: secret image-registry-private-configuration-user did not exist, getting config from installer-cloud-credentials secret")
 
 		// loads cluster wide configuration.
 		if sec, err = secLister.Get(defaults.CloudCredentialsName); err != nil {
@@ -120,8 +122,12 @@ func GetConfig(secLister kcorelisters.SecretNamespaceLister, infraLister configl
 			cfg.ResourceGroup = infra.Status.PlatformStatus.Azure.ResourceGroupName
 		}
 
+		klog.Infof("GetConfig: cfg=%+v", cfg)
+
 		return cfg, nil
 	}
+
+	klog.Info("GetConfig: found secret image-registry-private-configuration-user, getting account key from it")
 
 	// loads user provided account key.
 	key, err := util.GetValueFromSecret(sec, "REGISTRY_STORAGE_AZURE_ACCOUNTKEY")
@@ -134,6 +140,9 @@ func GetConfig(secLister kcorelisters.SecretNamespaceLister, infraLister configl
 			"storage account access key", sec.Namespace, sec.Name,
 		)
 	}
+
+	klog.Info("GetConfig: account key=%s", key)
+	klog.Info("GetConfig: returning")
 
 	return &Azure{
 		AccountKey: key,
@@ -531,59 +540,74 @@ func (d *driver) containerExists(ctx context.Context, environment autorestazure.
 }
 
 func (d *driver) storageExistsViaTrack2SDK(cr *imageregistryv1.Config, cfg *Azure, environment autorestazure.Environment) (exists bool, err error) {
+	klog.Info("storageExistsViaTrack2SDK: starting...")
 	key := cfg.AccountKey
 	federated_token := cfg.FederatedTokenFile
 	azClient, err := d.newAzClient(cfg, environment, nil)
 	if err != nil {
+		klog.Infof("storageExistsViaTrack2SDK: failed to created az client: %s", err)
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonAzureError, fmt.Sprintf("Unable to create azure client: %s", err))
 		return false, err
 	}
 	if key == "" && federated_token == "" {
+		klog.Info("storageExistsViaTrack2SDK: account key and federated token were empty, getting from api")
 		key, err = d.getKey(cfg, environment)
 		if err != nil {
 			util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonAzureError, fmt.Sprintf("Unable to get storage account key: %s", err))
 			return false, err
 		}
 
+		klog.Info("storageExistsViaTrack2SDK: got account key from api")
 	}
 
+	klog.Info("storageExistsViaTrack2SDK: getting blob url")
 	u, err := getBlobServiceURL(environment, d.Config.AccountName)
 	if err != nil {
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonConfigError, fmt.Sprintf("Unable to parse blob url: %s", err))
 		return false, err
 	}
+	klog.Info("storageExistsViaTrack2SDK: calling azClient.NewBlobClient")
 	blobClient, err := azClient.NewBlobClient(environment, d.Config.AccountName, key, fmt.Sprintf("%s://%s/", u.Scheme, u.Host))
 	if err != nil {
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonAzureError, fmt.Sprintf("Unable to create blob client: %s", err))
 		return false, err
 	}
 
+	klog.Info("storageExistsViaTrack2SDK: calling azClient.ContainerExists")
+
 	exists, err = blobClient.ContainerExists(d.Context, d.Config.AccountName, d.Config.Container)
 	if err != nil {
+		klog.Infof("storageExistsViaTrack2SDK: got error from container exists: %s", err)
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonAzureError, fmt.Sprintf("%s", err))
 		return false, err
 	}
 	if !exists {
+		klog.Info("storageExistsViaTrack2SDK: container did not exist")
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionFalse, storageExistsReasonContainerNotFound, fmt.Sprintf("Could not find storage container %s", d.Config.Container))
 		return false, nil
 	}
 
+	klog.Info("storageExistsViaTrack2SDK: container exists")
 	util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionTrue, storageExistsReasonContainerExists, "Storage container exists")
+	klog.Info("storageExistsViaTrack2SDK: returning")
 	return true, nil
 }
 
 // StorageExists checks if the storage container exists and is accessible.
 func (d *driver) StorageExists(cr *imageregistryv1.Config) (bool, error) {
+	klog.Info("StorageExists: starting")
 	if d.Config.AccountName == "" || d.Config.Container == "" {
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionFalse, storageExistsReasonNotConfigured, "Storage is not configured")
 		return false, nil
 	}
 
+	klog.Info("StorageExists: calling GetConfig")
 	cfg, err := GetConfig(d.Listers.Secrets, d.Listers.Infrastructures)
 	if err != nil {
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonConfigError, fmt.Sprintf("Unable to get configuration: %s", err))
 		return false, err
 	}
+	klog.Info("StorageExists: got fresh config from GetConfig")
 
 	environment, err := getEnvironmentByName(d.Config.CloudName)
 	if err != nil {
@@ -595,11 +619,15 @@ func (d *driver) StorageExists(cr *imageregistryv1.Config) (bool, error) {
 		return d.storageExistsViaTrack2SDK(cr, cfg, environment)
 	}
 
+	klog.Info("StorageExists: using regular storage exists method (skip viaTrack2SDK)")
+
 	key, err := d.getKey(cfg, environment)
 	if err != nil {
 		util.UpdateCondition(cr, defaults.StorageExists, operatorapiv1.ConditionUnknown, storageExistsReasonAzureError, fmt.Sprintf("Unable to get storage account key: %s", err))
 		return false, err
 	}
+
+	klog.Info("StorageExists: using regular storage exists method (skip viaTrack2SDK)")
 
 	exists, err := d.containerExists(d.Context, environment, d.Config.AccountName, key, d.Config.Container)
 	if err != nil {
@@ -775,17 +803,20 @@ func (d *driver) assureStorageAccount(cfg *Azure, infra *configv1.Infrastructure
 }
 
 func (d *driver) assureContainerViaTrack2SDK(cfg *Azure) (string, bool, error) {
+	klog.Info("assureContainerViaTrack2SDK: starting...")
 	environment, err := getEnvironmentByName(d.Config.CloudName)
 	if err != nil {
 		return "", false, err
 	}
 	key := cfg.AccountKey
 	federated_token := cfg.FederatedTokenFile
+	klog.Info("assureContainerViaTrack2SDK: calling newAzClient")
 	azClient, err := d.newAzClient(cfg, environment, nil)
 	if err != nil {
 		return "", false, err
 	}
 	if key == "" && federated_token == "" {
+		klog.Info("assureContainerViaTrack2SDK: both account key and federated token were empty, fetching account key via api")
 		storageAccountsClient, err := d.storageAccountsClient(cfg, environment)
 		if err != nil {
 			return "", false, err
@@ -802,11 +833,14 @@ func (d *driver) assureContainerViaTrack2SDK(cfg *Azure) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
+	klog.Info("assureContainerViaTrack2SDK: calling azClient.NewBlobClient")
 	blobClient, err := azClient.NewBlobClient(environment, d.Config.AccountName, key, fmt.Sprintf("%s://%s/", u.Scheme, u.Host))
 	if err != nil {
 		return "", false, err
 	}
+	klog.Info("assureContainerViaTrack2SDK: blob client created")
 	if d.Config.Container == "" {
+		klog.Info("assureContainerViaTrack2SDK: creating storage container")
 		containerName, err := util.GenerateStorageName(d.Listers, "")
 		if err != nil {
 			return "", false, err
@@ -817,9 +851,12 @@ func (d *driver) assureContainerViaTrack2SDK(cfg *Azure) (string, bool, error) {
 		); err != nil {
 			return "", false, err
 		}
+		klog.Info("assureContainerViaTrack2SDK: storage container created, returning")
 
 		return containerName, true, nil
 	}
+
+	klog.Info("assureContainerViaTrack2SDK: calling blobClient.ContainerExists")
 
 	if exists, err := blobClient.ContainerExists(
 		d.Context, d.Config.AccountName, d.Config.Container,
@@ -829,11 +866,14 @@ func (d *driver) assureContainerViaTrack2SDK(cfg *Azure) (string, bool, error) {
 		return d.Config.Container, false, nil
 	}
 
+	klog.Info("assureContainerViaTrack2SDK: container didn't exist, creating it")
+
 	if err = blobClient.CreateStorageContainer(
 		d.Context, d.Config.Container,
 	); err != nil {
 		return "", false, err
 	}
+	klog.Info("assureContainerViaTrack2SDK: created container, returning")
 	return d.Config.Container, true, nil
 }
 
@@ -841,6 +881,7 @@ func (d *driver) assureContainerViaTrack2SDK(cfg *Azure) (string, bool, error) {
 // generated automatically. Returns the container name (the provided one or the automatically
 // generated), if the container was created or was already there and an error.
 func (d *driver) assureContainer(cfg *Azure) (string, bool, error) {
+	klog.Info("assureContainer: starting...")
 	environment, err := getEnvironmentByName(d.Config.CloudName)
 	if err != nil {
 		return "", false, err
@@ -886,6 +927,7 @@ func (d *driver) assureContainer(cfg *Azure) (string, bool, error) {
 	); err != nil {
 		return "", false, err
 	}
+	klog.Info("assureContainer: returning...")
 	return d.Config.Container, true, nil
 }
 
@@ -934,6 +976,7 @@ func (d *driver) processUPI(cr *imageregistryv1.Config) {
 
 // CreateStorage attempts to create a storage account and a storage container.
 func (d *driver) CreateStorage(cr *imageregistryv1.Config) error {
+	klog.Info("CreateStorage: starting...")
 	cfg, err := GetConfig(d.Listers.Secrets, d.Listers.Infrastructures)
 	if err != nil {
 		util.UpdateCondition(
@@ -945,6 +988,8 @@ func (d *driver) CreateStorage(cr *imageregistryv1.Config) error {
 		)
 		return err
 	}
+
+	klog.Info("CreateStorage: called GetConfig")
 
 	// if AccountKey is present in our configuration it means it was provided by the user
 	// so we only verify if everything we need is in place.
